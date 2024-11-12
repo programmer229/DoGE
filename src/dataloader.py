@@ -18,7 +18,7 @@ from copy import deepcopy
 from transformers import AutoTokenizer
 import torch
 from torch.utils.data import WeightedRandomSampler
-from cfg_tokenizer import CFGTokenizer
+#from cfg_tokenizer import CFGTokenizer
 # transformers.utils.move_cache('/mloraw1/sfan/huggingface_cache')
 
 RANDOM_BATCH_SIZE = 512
@@ -234,6 +234,8 @@ def get_train_eval_datasets(data_config:DataTrainingArguments,
         del data_dict['train']['all']
     if 'all' in data_dict['val'].keys():
         del data_dict['val']['all']
+    if 'all' in data_dict['test'].keys():
+        del data_dict['test']['all']
     if doremi and ('mix' in data_dict['train'].keys()):
         del data_dict['train']['mix']
         del data_dict['val']['mix']
@@ -284,10 +286,12 @@ def get_train_eval_datasets(data_config:DataTrainingArguments,
                     val_dw=val_dw,
                     curriculum_path=data_config.curriculum_path,
                     **kwargs)
+    print(data_dict.keys())
     train_dict = {domain2idx[dom]:v for dom,v in data_dict['train'].items()}
     val_dict = {domain2idx[dom]:v for dom,v in data_dict['val'].items() if val_dw[domain2idx[dom]]>0}
-    
-    train_dataset_ls, val_dataset_ls = [], []
+    test_dict = {domain2idx[dom]:v for dom,v in data_dict['test'].items() if val_dw[domain2idx[dom]]>0}
+
+    train_dataset_ls, val_dataset_ls, test_dataset_ls = [], [], []
     for k in train_dict.keys():
         train_domain_dataset = IterableDataset.from_generator(domain_gen,
                                                 gen_kwargs={'data': train_dict[k],
@@ -300,6 +304,7 @@ def get_train_eval_datasets(data_config:DataTrainingArguments,
             print(f'{idx2domain[k]} loaded!')
     
     val_dw_gen = []
+    test_dw_gen = []
     for k in val_dict.keys():
         val_domain_dataset = IterableDataset.from_generator(domain_gen,
                                                 gen_kwargs={'data': val_dict[k],
@@ -307,6 +312,13 @@ def get_train_eval_datasets(data_config:DataTrainingArguments,
                                                             'domain_id': k,
                                                             }
                                                 )
+        test_domain_dataset = IterableDataset.from_generator(domain_gen,
+                                                gen_kwargs={'data': test_dict[k],
+                                                            'seq_len': sequence_length,
+                                                            'domain_id': k,
+                                                            }
+                                                )
+        test_dataset_ls.append(test_domain_dataset)
         val_dataset_ls.append(val_domain_dataset)
         val_dw_gen.append(val_dw[k])
         
@@ -320,7 +332,12 @@ def get_train_eval_datasets(data_config:DataTrainingArguments,
                     probabilities=torch.tensor(val_dw_gen),
                     probabilities_handle=torch.tensor(val_dw_gen),
                     seed=seed)
-    
+    test_ds = interleave_datasets(
+                    test_dataset_ls,
+                    probabilities=torch.tensor(val_dw_gen),
+                    probabilities_handle=torch.tensor(val_dw_gen),
+                    seed=seed)
+
     
     def take_data_generator(ds, max_samples):
         idx = 0
@@ -342,9 +359,9 @@ def get_train_eval_datasets(data_config:DataTrainingArguments,
     if 'cfg' not in data_config.dataset:
         tokenizer.model_max_length=data_config.max_token_length
     if data_config.curriculum_path is not None:
-        return train_ds, val_ds, domain_config, tokenizer, train_dataset_ls
+        return train_ds, val_ds, test_ds, domain_config, tokenizer, train_dataset_ls
     else:
-        return train_ds, val_ds, domain_config, tokenizer, None
+        return train_ds, val_ds, test_ds, domain_config, tokenizer, None
 
 def get_data_collator(tokenizer, return_tensors='pt', do_padding=False, max_length=1024):
     def data_collator(features):

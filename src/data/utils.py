@@ -4,7 +4,7 @@ import random
 import itertools
 
 from .slimpajama import get_slimpajama, get_slimpajama_6b, SUBSET2META
-from .wiki40b import get_wiki40b
+#from .wiki40b import get_wiki40b
 
 SLIMPAJAMA_DOMAINS = ['arxiv', 'book', 'c4', 'cc', 'github', 'stackexchange', 'wikipedia']
   
@@ -38,27 +38,34 @@ def get_dataset(args, dataset=None) -> Dict[str, np.ndarray]:
     if 'slim_6b' in trg_dataset:
         subset = trg_dataset.split('-')[1]
         if subset == 'all' or args.eval_all_domains:
-            all_train_list, all_val_list = [], []
+            all_train_list, all_val_list, all_test_list = [], [], []
             rst_dict = {}
             rst_dict['train'] = {}
             rst_dict['val'] = {}
+            rst_dict['test'] = {}
             for k in SUBSET2META.keys():
-                subset_data = get_slim_redpajama_6b(subset=k, num_proc=10)
+                subset_data = get_slimpajama_6b(subset=k, num_proc=2)
                 rst_dict['train'][k] = subset_data['train']
                 rst_dict['val'][k] = subset_data['val']
+                rst_dict['test'][k] = subset_data['val']
                 all_train_list.append(subset_data['train'])
                 all_val_list.append(subset_data['val'])
+                all_test_list.append(subset_data['test'])
             train_data = np.concatenate(all_train_list)
             val_data = np.concatenate(all_val_list)
+            test_data = np.concatenate(all_test_list)
             rst_dict['train']['all'] = train_data
             rst_dict['val']['all'] = val_data
+            rst_dict['test']['all'] = test_data
             
             if subset != 'all':
                 rst_dict['train'] = rst_dict['train'][subset]
                 if 'all' in rst_dict['val'].keys():
                     rst_dict['val'].pop('all')
+                if 'all' in rst_dict['test'].keys():
+                    rst_dict['test'].pop('all')
             return rst_dict
-        return get_slim_redpajama_6b(subset=subset, num_proc=10)
+        return get_slimpajama_6b(subset=subset, num_proc=10)
     elif 'slim_full' in trg_dataset:
         subset = trg_dataset.split('-')[1]
         if subset =='all':
@@ -102,7 +109,7 @@ def get_dataset(args, dataset=None) -> Dict[str, np.ndarray]:
             rst_dict['train']['mix'] = mix_train_data
             rst_dict['val']['mix'] = mix_val_data
             return rst_dict
-        return get_slim_redpajama(subset=subset, num_proc=10)
+        return get_slim_redpajama(subset=subset, num_proc=2)
     elif 'slim_ood' in trg_dataset:
         subset_ood = trg_dataset.split('-')[1]
         rst_dict = {}

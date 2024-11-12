@@ -295,6 +295,7 @@ class GPT2DoGE(GPT2LMHeadModel):
             return ((loss,) + output) if loss is not None else output
 
         out_hidden_states = fwd_output.hidden_states
+        #print("MEMEME")
         return CausalLMOutputWithDomainIDs(
             loss=loss,
             logits=lm_logits,

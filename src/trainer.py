@@ -115,8 +115,81 @@ from dataloader import DataTrainingArguments, get_data_collator, get_train_eval_
 from models import CausalLMOutputWithDomainIDs, ModelArguments, get_model_from_config, GPT2DoGE
 import logging
 from accelerate import Accelerator, skip_first_batches
+import torch.nn.functional as F
 
+import torch
+from collections import defaultdict
 
+class ProportionalDataLoader:
+    def __init__(self, dataloader, train_dw):
+        """
+        Initializes the ProportionalDataLoader.
+
+        Args:
+        - dataloader (DataLoader): The base dataloader to pull batches from.
+        - train_dw (dict): Dictionary specifying the target proportion for each domain.
+        """
+        self.dataloader = dataloader
+        self.train_dw = train_dw
+
+    def gather_batches_for_proportion(self):
+        if self.train_dw.is_sparse:
+            self.train_dw = self.train_dw.to_dense()
+
+        total_samples = len(self.train_dw)
+        domain_targets = {domain: int(total_samples * self.train_dw[domain].item()) 
+                        for domain in range(len(self.train_dw))}
+        
+        accumulated_input_ids = []
+        accumulated_domain_ids = []
+        domain_counts = {domain: 0 for domain in range(len(self.train_dw))}
+        
+        # Accumulate batches until target sample sizes are reached
+        for batch in self.dataloader:
+            domain_ids = batch['domain_ids'].view(-1)  # Flatten to 1D tensor
+            input_ids = batch['input_ids']
+            
+            for domain, target_count in domain_targets.items():
+                domain_mask = (domain_ids == domain)  # 1D mask to match input_ids dimension
+                
+                # Select samples that match the domain, if any
+                domain_samples = input_ids[domain_mask]
+                print(domain_samples)
+                
+                if domain_samples.size(0) == 0:
+                    continue  # Skip if no samples match this domain
+
+                samples_needed = target_count - domain_counts[domain]
+                samples_to_add = min(samples_needed, domain_samples.size(0))
+                
+                accumulated_input_ids.extend(domain_samples[:samples_to_add])
+                accumulated_domain_ids.extend([domain] * samples_to_add)
+                
+                domain_counts[domain] += samples_to_add
+
+            # Stop accumulating if all targets are met
+            if all(domain_counts[domain] >= domain_targets[domain] for domain in domain_targets):
+                break
+
+        # Ensure we have accumulated samples before stacking
+        if accumulated_input_ids:
+            new_batch = {
+                'domain_ids': torch.tensor(accumulated_domain_ids, device=input_ids.device),
+                'input_ids': torch.stack(accumulated_input_ids)
+            }
+        else:
+            raise ValueError("No samples found for the specified proportions. Check if domains are present in the data.")
+
+        return new_batch
+
+    def __iter__(self):
+        """Yield batches with the target domain proportions."""
+        while True:
+            yield self.gather_batches_for_proportion()
+
+    def __len__(self):
+        """Approximate the number of batches (if possible) based on original dataloader."""
+        return len(self.dataloader)
 @dataclass
 class FullTrainingArguments(TrainingArguments):
     lr_end: float = field(
@@ -128,6 +201,9 @@ class FullTrainingArguments(TrainingArguments):
     )
     doremi: bool = field(
         default=False, metadata={"help": "DoReMi."}
+    )
+    ddk: bool = field(
+        default=False, metadata={"help": "DDK."}
     )
     ref_model: str = field(
         default=None, metadata={"help": "path to pretrained reference model (only used to run DoReMi)."}
@@ -335,7 +411,7 @@ class DoGETrainer(Trainer):
     def __init__(self, *args, domain_args, 
                  cc_selection=None, cc_ns=None, cc_steps=None, selected_modules_ls=None, selected_params_num=None, 
                  total_iterations=10000, wandb_run_name="test_test_test", output_dir=None,
-                 grad_acc=None, ref_model=None, train_dataset_ls=None,
+                 grad_acc=None, ref_model=None, train_dataset_ls=None,test_dataset=None,train_orig_dataset=None,
                  **kwargs,):
         ''' args to init the original Trainer
           model: Union[PreTrainedModel, nn.Module] = None,
@@ -369,11 +445,16 @@ class DoGETrainer(Trainer):
 
         self.reweight_eps = self.args.reweight_eps
         self.doge = self.args.reweight_domains 
+        self.train_orig_dataset = train_orig_dataset
         self.doremi = self.args.doremi 
+        self.ddk = self.args.ddk
+        self.test_dataset = test_dataset
         self.ref_model = ref_model
         self.mu = self.args.mu
+        self.was_calc = None
         self.dw_min = self.args.dw_min
         self.dw_max = self.args.dw_max
+        self.ddk_iter = 1000
         self.compute_pertoken_losses = self.args.compute_pertoken_losses
         self.cc_selection = cc_selection
         self.cc_ns = cc_ns
@@ -548,8 +629,8 @@ class DoGETrainer(Trainer):
             )
             self._created_lr_scheduler = True
         return self.lr_scheduler
-    
-    def compute_loss(self, model, inputs, return_outputs=False, return_pertoken_losses=False):
+   
+    def compute_loss(self, model, inputs, return_outputs=False, return_pertoken_losses=False, is_ddk = False):
         """
         How the loss is computed by Trainer. By default, all models return the loss in the first element.
 
@@ -561,8 +642,11 @@ class DoGETrainer(Trainer):
             labels = None
 
         inputs['return_pertoken_losses'] = return_pertoken_losses
-        outputs = model(**inputs)
-
+        if not is_ddk:
+            outputs = model(**inputs)
+        else:
+            outputs = model(**inputs, output_hidden_states = True)
+        #print(outputs["hidden_states"].shape)
         if self.args.past_index >= 0:
             self._past = outputs[self.args.past_index]
 
@@ -584,8 +668,11 @@ class DoGETrainer(Trainer):
                 )
             # We don't use .loss here since the model may return tuples instead of ModelOutput.
             loss = outputs["loss"] if isinstance(outputs, dict) else outputs[0]
-
-        return (loss, outputs) if return_outputs else loss
+        if not is_ddk:
+            return (loss, outputs) if return_outputs else loss
+        else:
+            return (loss, outputs, F.log_softmax(outputs["hidden_states"])) if return_outputs else (loss, F.log_softmax(outputs["hidden_states"]))
+    
     
     def update_domain_weights(self, pertoken_losses, token_masks, domain_ids):
         wandb_log_dict = {}
@@ -786,7 +873,116 @@ class DoGETrainer(Trainer):
         wandb_log_dict['lr'] = lr_t
         
         wandb.log(wandb_log_dict, commit=False)
-    
+    def update_domain_weights_ddk(self, model):
+        test_dataloader = self.get_test_dataloader(self.test_dataset)
+        self.domain_losses = [torch.tensor(0.0) for _ in range(len(self.domain_list))] 
+        self.ref_domain_losses = [torch.tensor(0.0) for _ in range(len(self.domain_list))] 
+        self.tot_size = [torch.tensor(0.0) for _ in range(len(self.domain_list))]
+        soft = torch.nn.Softmax()
+        for step, inputs in enumerate(test_dataloader):
+            if step > 1000:
+                break
+            inputs = self._prepare_inputs(inputs)
+            for domain_id in range(len(self.domain_list)):
+                new_inputs = self.filter_inputs(inputs, domain_id)
+                if new_inputs is None:
+                    continue
+                with self.compute_loss_context_manager():
+                    loss = self.compute_loss(model, new_inputs, return_outputs=False, return_pertoken_losses=False, is_ddk=False)
+                    ref_loss = self.compute_loss(self.ref_model, new_inputs, return_outputs=False, return_pertoken_losses=False, is_ddk=False)
+                    #self.tot_size += new_inputs.shape[0]
+                    #loss = torch.exp(loss)
+                    #ref_loss = torch.exp(ref_loss)
+                    self.domain_losses[domain_id] += loss.detach().cpu() * new_inputs["input_ids"].shape[0]
+                    self.ref_domain_losses[domain_id] += ref_loss.detach().cpu() * new_inputs["input_ids"].shape[0]
+        theta = [torch.tensor(0.0) for _ in range(len(self.domain_list))]
+        if self.was_calc is None:
+            self.was_calc = True
+            for i in range(len(theta)):
+                theta[i] = self.domain_losses[i]
+            #theta_sum = sum(theta)
+            dw_new = soft(torch.stack(theta))
+        else:
+            for i in range(len(theta)):
+                theta[i] = torch.log(self.train_dw[self.train_ids][i]) * self.domain_losses[i] / self.ref_domain_losses[i]
+            #theta_sum = sum(theta)
+            dw_new = soft(torch.stack(theta)) * 0.5 +  0.5 / len(theta)
+        
+        self.train_dw[self.train_ids] = dw_new
+        wandb_log_dict = {}
+        for domain_idx in range(len(self.domain_list)):
+            domain_name = self.idx2domain[domain_idx]
+            wandb_log_dict[f'loss_train/{domain_name}'] = self.domain_losses[domain_idx].item()
+            wandb_log_dict[f'loss_ref/{domain_name}'] = self.ref_domain_losses[domain_idx].item()
+            wandb_log_dict[f'cur_dw/{domain_name}'] = dw_new[domain_idx].item()
+        wandb.log(wandb_log_dict, commit=False)
+        self.avg_dw[self.train_ids] += dw_new
+        self.dw_update_steps += 1
+        return
+    def train_step_ddk(self, model, inputs):
+        assert self.ddk, "Only run this function for ddk!"
+        print(self.ref_model)
+        self.domain_losses_distributed = [torch.tensor(0.0) for _ in range(len(self.domain_list))] 
+        self.ref_domain_losses_distributed = [torch.tensor(0.0) for _ in range(len(self.domain_list))] 
+
+        loss_all = torch.tensor(0.0)
+        ref_loss_all = torch.tensor(0.0)
+        effective_domains = 0
+        sample_counter = Counter(inputs["domain_ids"].flatten().detach().cpu().numpy())
+        for i, c in sample_counter.items():
+            if i in self.domain_update_counter.keys():
+                self.domain_update_counter[i] += c
+        self.grad_acc_step += 1
+        all_hidden_states = []
+        ref_all_hidden_states = []
+        loss_meme = torch.tensor(0.0)
+        for domain_id in range(len(self.domain_list)):
+            new_inputs = self.filter_inputs(inputs, domain_id)
+            if new_inputs is None:
+                continue
+            with self.compute_loss_context_manager():
+                ce_loss, hidden_state = self.compute_loss(model, new_inputs, return_outputs=False, return_pertoken_losses=False, is_ddk=True)
+                ref_ce_loss, ref_hidden_state = self.compute_loss(self.ref_model, new_inputs, return_outputs=False, return_pertoken_losses=False, is_ddk=True)
+                all_hidden_states.append(hidden_state)
+                ref_all_hidden_states.append(ref_hidden_state)
+
+            # Compute KL Divergence
+                kl_loss = F.kl_div(
+                    hidden_state,
+                    ref_hidden_state,
+                    reduction='mean',
+                    log_target=True
+                )
+                loss = ce_loss + 0.2 * kl_loss
+
+                #self.domain_losses_distributed[domain_id] = ce_loss + self.domain_losses_distributed[domain_id]
+                #self.ref_domain_losses_distributed[domain_id] = ref_ce_loss + self.ref_domain_losses_distributed[domain_id]
+                #ref_loss_all += ref_ce_loss.detach().cpu()
+                loss_all += loss.detach().cpu()
+                loss_meme += loss.cpu()
+            effective_domains += 1
+        
+        if self.ddk_iter == 1000:
+            # Update domain weights for DDK
+            self.update_domain_weights_ddk(model)
+
+            self.ddk_iter = 0
+            self.domain_losses_distributed = [torch.tensor(0.0) for _ in range(len(self.domain_list))] 
+            self.ref_domain_losses_distributed = [torch.tensor(0.0) for _ in range(len(self.domain_list))] 
+        self.ddk_iter += 1
+        if loss_meme > 0.0:
+            if self.use_apex:
+                with amp.scale_loss(loss_meme, self.optimizer) as scaled_curr_domain_losses:
+                    scaled_curr_domain_losses.backward()
+            else:
+                self.accelerator.backward(loss_meme)
+            if self.args.max_grad_norm > 0.0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+            
+
+        # Return loss and hidden states
+        return loss_all / effective_domains
+
     def train_step_doremi(self, model, inputs):
         assert self.doremi, "Only run this function for doremi!"
         self.domain_losses_distributed = [torch.tensor(0.0) for _ in range(len(self.domain_list))] 
@@ -805,9 +1001,9 @@ class DoGETrainer(Trainer):
             if new_inputs is None:
                 continue
             with self.compute_loss_context_manager():
-                loss, outputs = self.compute_loss(model, new_inputs, return_outputs=True, return_pertoken_losses=False)
+                loss, outputs= self.compute_loss(model, new_inputs, return_outputs=True, return_pertoken_losses=False)
                 ref_loss, ref_outputs = self.compute_loss(self.ref_model, new_inputs, return_outputs=True, return_pertoken_losses=False)
-            
+            print(self.args.world_size)
             if self.args.world_size>1:
                 if self.is_local_process_zero():
                     gathered_losses = [
@@ -832,6 +1028,7 @@ class DoGETrainer(Trainer):
                 if self.args.n_gpu > 1:
                     loss = loss.mean()
                     ref_loss = ref_loss.mean()
+                print(domain_id, 42)
                 self.domain_losses_distributed[domain_id] = loss+self.domain_losses_distributed[domain_id]
                 self.ref_domain_losses_distributed[domain_id] = ref_loss+self.ref_domain_losses_distributed[domain_id]
                 ref_loss_all += ref_loss.detach().cpu()
@@ -876,7 +1073,7 @@ class DoGETrainer(Trainer):
             
             if domain_idx in self.train_ids:
                 score_idx = self.train_ids.tolist().index(domain_idx)
-                curr_domain_losses = domain_losses_distributed[score_idx] * dw_new[score_idx]
+                curr_domain_losses = domain_losses_distributed[score_idx] #* dw_new[score_idx]
                 if curr_domain_losses > 0.0:
                     if self.use_apex:
                         with amp.scale_loss(curr_domain_losses, self.optimizer) as scaled_curr_domain_losses:
@@ -1033,6 +1230,8 @@ class DoGETrainer(Trainer):
             return self.train_cancellation(model, inputs)
         if self.doremi:
             return self.train_step_doremi(model, inputs)
+        elif self.ddk:
+            return self.train_step_ddk(model, inputs)
         elif self.doge:
             if not self.compute_pertoken_losses:
                 if self.domain_update_per_iter is not None:
@@ -1778,6 +1977,7 @@ class DoGETrainer(Trainer):
             while self.state.global_step < steps_in_epoch:
                 epoch_iterator = train_dataloader
                 for step, inputs in enumerate(epoch_iterator):
+                    
                     total_batched_samples += 1
 
                     if self.args.include_num_input_tokens_seen:
@@ -2249,11 +2449,23 @@ class DoGETrainer(Trainer):
                 rng_to_sync = True
 
             step = -1
+            logger.warning("FALKLFAKLKSFLASLF")
+            print(self.train_dw)
+            #epoch_iterator = ProportionalDataLoader(epoch_iterator, self.train_dw)
             for step, inputs in enumerate(epoch_iterator):
+                print(step)
             # while self.state.global_step < steps_in_epoch:
                 # inputs = next(epoch_iterator.__iter__())
                 # step += 1
                 total_batched_samples += 1
+                if total_batched_samples % 1000 == 1:
+                    self.train_dataset = interleave_datasets(
+                        self.train_orig_dataset,
+                        probabilities=self.train_dw,
+                        probabilities_handle=self.train_dw,
+                        seed=42)
+                    train_dataloader = self.get_train_dataloader()
+                    epoch_iterator = train_dataloader
 
                 if self.args.include_num_input_tokens_seen:
                     main_input_name = getattr(self.model, "main_input_name", "input_ids")
@@ -2286,7 +2498,7 @@ class DoGETrainer(Trainer):
     
                 with self.accelerator.accumulate(model):
                     tr_loss_step = self.training_step(model, inputs)
-
+                #epoch_iterator.train_dw = self.train_dw
                 if (
                     args.logging_nan_inf_filter
                     and not is_torch_tpu_available()

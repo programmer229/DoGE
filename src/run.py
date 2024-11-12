@@ -39,6 +39,8 @@ args_parser.add_argument('--total_iterations', default=10000, type=int)
 def main():
     args = args_parser.parse_args()
     os.environ["WANDB_PROJECT"] = args.wandb_proj # name your W&B project 
+    os.environ["HF_HOME"] = "/scratch/izar/dzenhali/.cache/"
+    os.environ["XDG_CACHE_HOME"] = "/scratch/izar/dzenhali/.cache/"
     config_parser = HfArgumentParser((ModelArguments, DataTrainingArguments, FullTrainingArguments))
     if args.config_json is not None:
         model_args, data_args, training_args = config_parser.parse_json_file(json_file=args.config_json)
@@ -59,14 +61,14 @@ def main():
         datefmt="%m/%d/%Y %H:%M:%S",
         handlers=[logging.StreamHandler(sys.stdout)],
     )
-    train_ds, val_ds, domain_config, tokenizer, train_dataset_ls = get_train_eval_datasets(data_config=data_args,
+    train_ds, val_ds, test_ds, domain_config, tokenizer, train_dataset_ls = get_train_eval_datasets(data_config=data_args,
                                                         verbose=True,
                                                         doremi=training_args.doremi,
                                                         ) 
     
     data_collator=get_data_collator(tokenizer, do_padding=data_args.do_padding, max_length=data_args.max_token_length)
     grad_acc_steps = training_args.gradient_accumulation_steps
-    if training_args.doremi:
+    if training_args.doremi or training_args.ddk:
         # TODO: train reference model for doremi
         if training_args.ref_model is not None:
             logger.info("*** Load Reference Model (DoReMi) ***")
@@ -83,6 +85,8 @@ def main():
                 domain_args=domain_config,
                 train_dataset=train_ds if training_args.do_train else None,
                 eval_dataset=val_ds if training_args.do_eval else None,
+                test_dataset=test_ds,
+                train_orig_dataset=train_dataset_ls,
                 tokenizer=tokenizer,
                 data_collator=data_collator,
                 selected_modules_ls=None,
@@ -112,6 +116,7 @@ def main():
             domain_args=domain_config,
             train_dataset=train_ds if training_args.do_train else None,
             eval_dataset=val_ds if training_args.do_eval else None,
+            test_dataset=test_ds,
             tokenizer=tokenizer,
             data_collator=data_collator,
             cc_selection=args.cc_selection,
@@ -174,6 +179,7 @@ def main():
         domain_args=domain_config,
         train_dataset=train_ds if training_args.do_train else None,
         eval_dataset=val_ds if training_args.do_eval else None,
+        test_dataset=test_ds,
         tokenizer=tokenizer,
         data_collator=data_collator,
         selected_modules_ls=selected_modules_ls,
