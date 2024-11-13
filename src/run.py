@@ -117,6 +117,7 @@ def main():
             train_dataset=train_ds if training_args.do_train else None,
             eval_dataset=val_ds if training_args.do_eval else None,
             test_dataset=test_ds,
+                            train_orig_dataset=train_dataset_ls,
             tokenizer=tokenizer,
             data_collator=data_collator,
             cc_selection=args.cc_selection,
@@ -180,6 +181,8 @@ def main():
         train_dataset=train_ds if training_args.do_train else None,
         eval_dataset=val_ds if training_args.do_eval else None,
         test_dataset=test_ds,
+                                    train_orig_dataset=train_dataset_ls,
+
         tokenizer=tokenizer,
         data_collator=data_collator,
         selected_modules_ls=selected_modules_ls,

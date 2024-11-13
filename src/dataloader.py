@@ -361,7 +361,7 @@ def get_train_eval_datasets(data_config:DataTrainingArguments,
     if data_config.curriculum_path is not None:
         return train_ds, val_ds, test_ds, domain_config, tokenizer, train_dataset_ls
     else:
-        return train_ds, val_ds, test_ds, domain_config, tokenizer, None
+        return train_ds, val_ds, test_ds, domain_config, tokenizer, train_dataset_ls
 
 def get_data_collator(tokenizer, return_tensors='pt', do_padding=False, max_length=1024):
     def data_collator(features):
