@@ -1067,6 +1067,7 @@ class DoGETrainer(Trainer):
     def update_domain_weights_doremi(self, domain_losses_distributed, ref_domain_losses_distributed):
         assert self.doremi, "Only run this function for doremi!"
         self.ddk_iter += 1
+        wandb_log_dict = {}
         if self.ddk_iter % 1000 == 0:
             self.domain_losses = [torch.tensor(0.0) for _ in range(len(self.domain_list))] 
             self.ref_domain_losses = [torch.tensor(0.0) for _ in range(len(self.domain_list))] 
@@ -1104,9 +1105,9 @@ class DoGETrainer(Trainer):
             self.avg_dw[self.train_ids] += dw_new
             self.dw_update_steps += 1
             self.write_weights(cur_weights=self.train_dw, avg_weights=self.avg_dw/self.dw_update_steps)
+            wandb_log_dict[f'avg_dw/{domain_name}'] = self.avg_dw[domain_idx].item() / self.dw_update_steps
+            wandb_log_dict[f'cur_dw/{domain_name}'] = self.train_dw[domain_idx].item()
 
-
-        wandb_log_dict = {}
 
     
         for domain_idx in range(len(self.domain_list)):
@@ -1126,8 +1127,7 @@ class DoGETrainer(Trainer):
                 if self.ddk_iter % 1000 == 0:
                     wandb_log_dict[f'score/{domain_name}'] = excess_losses[score_idx].item()
                 wandb_log_dict[f'loss/{domain_name}'] = domain_losses_distributed[score_idx]
-            wandb_log_dict[f'avg_dw/{domain_name}'] = self.avg_dw[domain_idx].item() / self.dw_update_steps
-            wandb_log_dict[f'cur_dw/{domain_name}'] = self.train_dw[domain_idx].item()
+
             if domain_idx in self.domain_update_counter.keys():
                 wandb_log_dict[f'sample_count/{domain_name}'] = self.domain_update_counter[domain_idx]    
         
