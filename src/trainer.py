@@ -671,7 +671,7 @@ class DoGETrainer(Trainer):
         if not is_ddk:
             return (loss, outputs) if return_outputs else loss
         else:
-            return (loss, outputs, F.log_softmax(outputs["hidden_states"])) if return_outputs else (loss, F.log_softmax(outputs["hidden_states"]))
+            return (loss, outputs, F.log_softmax(outputs["hidden_states"], dim=-1)) if return_outputs else (loss, F.log_softmax(outputs["hidden_states"], dim=-1))
     
     
     def update_domain_weights(self, pertoken_losses, token_masks, domain_ids):
@@ -915,9 +915,12 @@ class DoGETrainer(Trainer):
             wandb_log_dict[f'loss_train/{domain_name}'] = self.domain_losses[domain_idx].item()
             wandb_log_dict[f'loss_ref/{domain_name}'] = self.ref_domain_losses[domain_idx].item()
             wandb_log_dict[f'cur_dw/{domain_name}'] = dw_new[domain_idx].item()
+            if domain_idx in self.domain_update_counter.keys():
+                wandb_log_dict[f'sample_count/{domain_name}'] = self.domain_update_counter[domain_idx]   
         wandb.log(wandb_log_dict, commit=False)
         self.avg_dw[self.train_ids] += dw_new
         self.dw_update_steps += 1
+
         return
     def train_step_ddk(self, model, inputs):
         assert self.ddk, "Only run this function for ddk!"
@@ -938,6 +941,8 @@ class DoGETrainer(Trainer):
         loss_meme = torch.tensor(0.0)
         for domain_id in range(len(self.domain_list)):
             new_inputs = self.filter_inputs(inputs, domain_id)
+            #if self.ddk_iter == 1000:
+                #logger.warn(new_inputs)
             if new_inputs is None:
                 continue
             with self.compute_loss_context_manager():
@@ -945,15 +950,19 @@ class DoGETrainer(Trainer):
                 ref_ce_loss, ref_hidden_state = self.compute_loss(self.ref_model, new_inputs, return_outputs=False, return_pertoken_losses=False, is_ddk=True)
                 all_hidden_states.append(hidden_state)
                 ref_all_hidden_states.append(ref_hidden_state)
+                logger.warn(torch.exp(hidden_state))  # Predicted probabilities
+                logger.warn(torch.exp(ref_hidden_state))  # Reference probabilities
 
             # Compute KL Divergence
                 kl_loss = F.kl_div(
                     hidden_state,
                     ref_hidden_state,
-                    reduction='mean',
+                    reduction='batchmean',
                     log_target=True
                 )
-                loss = ce_loss + 0.2 * kl_loss
+                #logger.warn(ce_loss)
+                #logger.warn(kl_loss)
+                loss = ce_loss + 0.05 * kl_loss
 
                 #self.domain_losses_distributed[domain_id] = ce_loss + self.domain_losses_distributed[domain_id]
                 #self.ref_domain_losses_distributed[domain_id] = ref_ce_loss + self.ref_domain_losses_distributed[domain_id]
@@ -1001,8 +1010,17 @@ class DoGETrainer(Trainer):
             if new_inputs is None:
                 continue
             with self.compute_loss_context_manager():
-                loss, outputs= self.compute_loss(model, new_inputs, return_outputs=True, return_pertoken_losses=False)
-                ref_loss, ref_outputs = self.compute_loss(self.ref_model, new_inputs, return_outputs=True, return_pertoken_losses=False)
+                loss, outputs, hid= self.compute_loss(model, new_inputs, return_outputs=True, return_pertoken_losses=False, is_ddk=True)
+                ref_loss, ref_outputs, ref_hid = self.compute_loss(self.ref_model, new_inputs, return_outputs=True, return_pertoken_losses=False, is_ddk=True)
+                kl_loss = F.kl_div(
+                    hid,
+                    ref_hid,
+                    reduction='batchmean',
+                    log_target=True
+                )
+                #logger.warn(ce_loss)
+                #logger.warn(kl_loss)
+                loss = loss + 0.05 * kl_loss
             print(self.args.world_size)
             if self.args.world_size>1:
                 if self.is_local_process_zero():
@@ -1048,21 +1066,42 @@ class DoGETrainer(Trainer):
     
     def update_domain_weights_doremi(self, domain_losses_distributed, ref_domain_losses_distributed):
         assert self.doremi, "Only run this function for doremi!"
-        excess_losses = torch.tensor([domain_losses_distributed[i]-ref_domain_losses_distributed[i] for i in range(len(domain_losses_distributed))], dtype=torch.float)
-        for i in range(len(excess_losses)):
-            if (domain_losses_distributed[i]>0.0 or self.perdomain_scores is None):
-                continue
-            excess_losses[i] = self.perdomain_scores[i]
+        self.ddk_iter += 1
+        if self.ddk_iter % 1000 == 0:
+            self.domain_losses = [torch.tensor(0.0) for _ in range(len(self.domain_list))] 
+            self.ref_domain_losses = [torch.tensor(0.0) for _ in range(len(self.domain_list))] 
+            self.tot_size = [torch.tensor(0.0) for _ in range(len(self.domain_list))]
+            for step, inputs in enumerate(test_dataloader):
+                if step > 1000:
+                    break
+                inputs = self._prepare_inputs(inputs)
+                for domain_id in range(len(self.domain_list)):
+                    new_inputs = self.filter_inputs(inputs, domain_id)
+                    if new_inputs is None:
+                        continue
+                    with self.compute_loss_context_manager():
+                        loss = self.compute_loss(model, new_inputs, return_outputs=False, return_pertoken_losses=False, is_ddk=False)
+                        ref_loss = self.compute_loss(self.ref_model, new_inputs, return_outputs=False, return_pertoken_losses=False, is_ddk=False)
+                        #self.tot_size += new_inputs.shape[0]
+                        #loss = torch.exp(loss)
+                        #ref_loss = torch.exp(ref_loss)
+                        self.domain_losses[domain_id] += loss.detach().cpu() * new_inputs["input_ids"].shape[0]
+                        self.ref_domain_losses[domain_id] += ref_loss.detach().cpu() * new_inputs["input_ids"].shape[0]
+            excess_losses = torch.tensor([self.domain_losses[i]-self.ref_domain_losses[i] for i in range(len(domain_losses_distributed))], dtype=torch.float)
+            for i in range(len(excess_losses)):
+                if (domain_losses_distributed[i]>0.0 or self.perdomain_scores is None):
+                    continue
+                excess_losses[i] = self.perdomain_scores[i]
+            
+            excess_losses = torch.clip(excess_losses, min=0.0)        
+            self.perdomain_scores = excess_losses.detach().cpu().tolist()
+            lr_t = self.lr_scheduler.get_last_lr()[0] if self.lr_scheduler is not None else self.args.learning_rate
+            log_new_train_dw = torch.log(self.train_dw) + 0.1 * excess_losses
+            log_new_train_dw = log_new_train_dw - torch.logsumexp(log_new_train_dw, dim=0) # softmax normalization
+            # smoothing
+            dw_new = (1-self.reweight_eps) * torch.exp(log_new_train_dw) + self.reweight_eps / len(log_new_train_dw)
         wandb_log_dict = {}
-        
-        excess_losses = torch.clip(excess_losses, min=0.0)        
-        self.perdomain_scores = excess_losses.detach().cpu().tolist()
-        lr_t = self.lr_scheduler.get_last_lr()[0] if self.lr_scheduler is not None else self.args.learning_rate
-        log_new_train_dw = torch.log(self.train_dw) + 0.1 * excess_losses
-        log_new_train_dw = log_new_train_dw - torch.logsumexp(log_new_train_dw, dim=0) # softmax normalization
-        # smoothing
-        dw_new = (1-self.reweight_eps) * torch.exp(log_new_train_dw) + self.reweight_eps / len(log_new_train_dw)
-        
+
         self.train_dw[self.train_ids] = dw_new
         self.avg_dw[self.train_ids] += dw_new
         self.dw_update_steps += 1
@@ -2452,117 +2491,120 @@ class DoGETrainer(Trainer):
             logger.warning("FALKLFAKLKSFLASLF")
             print(self.train_dw)
             #epoch_iterator = ProportionalDataLoader(epoch_iterator, self.train_dw)
-            for step, inputs in enumerate(epoch_iterator):
-                print(step)
-            # while self.state.global_step < steps_in_epoch:
-                # inputs = next(epoch_iterator.__iter__())
-                # step += 1
-                total_batched_samples += 1
-                if total_batched_samples % 1000 == 1:
-                    self.train_dataset = interleave_datasets(
-                        self.train_orig_dataset,
-                        probabilities=self.train_dw,
-                        probabilities_handle=self.train_dw,
-                        seed=42)
-                    train_dataloader = self.get_train_dataloader()
-                    epoch_iterator = train_dataloader
+            while not self.control.should_epoch_stop and not self.control.should_training_stop:                
+                for step, inputs in enumerate(epoch_iterator):
+                    print(step)
+                # while self.state.global_step < steps_in_epoch:
+                    # inputs = next(epoch_iterator.__iter__())
+                    # step += 1
+                    total_batched_samples += 1
+                    if total_batched_samples % 1000 == 1:
+                        #logger.warning(self.train_dw)
+                        self.train_dataset = interleave_datasets(
+                            self.train_orig_dataset,
+                            probabilities=self.train_dw,
+                            probabilities_handle=self.train_dw,
+                            seed=total_batched_samples)
+                        train_dataloader = self.get_train_dataloader()
+                        epoch_iterator = train_dataloader
+                        break
 
-                if self.args.include_num_input_tokens_seen:
-                    main_input_name = getattr(self.model, "main_input_name", "input_ids")
-                    if main_input_name not in inputs:
-                        logger.warning(
-                            "Tried to track the number of tokens seen, however the current model is "
-                            "not configured properly to know what item is the input. To fix this, add "
-                            "a `main_input_name` attribute to the model class you are using."
-                        )
-                    else:
-                        self.state.num_input_tokens_seen += self.accelerator.gather(inputs[main_input_name]).numel()
-                if rng_to_sync:
-                    self._load_rng_state(resume_from_checkpoint)
-                    rng_to_sync = False
-
-                # Skip past any already trained steps if resuming training
-                if steps_trained_in_current_epoch > 0:
-                    steps_trained_in_current_epoch -= 1
-                    if steps_trained_progress_bar is not None:
-                        steps_trained_progress_bar.update(1)
-                    if steps_trained_in_current_epoch == 0:
-                        self._load_rng_state(resume_from_checkpoint)
-                    continue
-                elif steps_trained_progress_bar is not None:
-                    steps_trained_progress_bar.close()
-                    steps_trained_progress_bar = None
-
-                if step % args.gradient_accumulation_steps == 0:
-                    self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
-    
-                with self.accelerator.accumulate(model):
-                    tr_loss_step = self.training_step(model, inputs)
-                #epoch_iterator.train_dw = self.train_dw
-                if (
-                    args.logging_nan_inf_filter
-                    and not is_torch_tpu_available()
-                    and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
-                ):
-                    # if loss is nan or inf simply add the average of previous logged losses
-                    tr_loss += tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
-                else:
-                    tr_loss += tr_loss_step
-
-                self.current_flos += float(self.floating_point_ops(inputs))
-
-                is_last_step_and_steps_less_than_grad_acc = (
-                    steps_in_epoch <= args.gradient_accumulation_steps and (step + 1) == steps_in_epoch
-                )
-
-                if (
-                    total_batched_samples % args.gradient_accumulation_steps == 0
-                    or
-                    # last step in epoch but step is always smaller than gradient_accumulation_steps
-                    is_last_step_and_steps_less_than_grad_acc
-                ):
-                    # the `or` condition of `is_last_step_and_steps_less_than_grad_acc` is not covered
-                    # in accelerate. So, explicitly enable sync gradients to True in that case.
-                    if is_last_step_and_steps_less_than_grad_acc:
-                        self.accelerator.gradient_state._set_sync_gradients(True)
-
-                    # Gradient clipping
-                    if args.max_grad_norm is not None and args.max_grad_norm > 0:
-                        # deepspeed does its own clipping
-
-                        if is_sagemaker_mp_enabled() and args.fp16:
-                            self.optimizer.clip_master_grads(args.max_grad_norm)
-                        elif self.use_apex:
-                            # Revert to normal clipping otherwise, handling Apex or full precision
-                            nn.utils.clip_grad_norm_(
-                                amp.master_params(self.optimizer),
-                                args.max_grad_norm,
+                    if self.args.include_num_input_tokens_seen:
+                        main_input_name = getattr(self.model, "main_input_name", "input_ids")
+                        if main_input_name not in inputs:
+                            logger.warning(
+                                "Tried to track the number of tokens seen, however the current model is "
+                                "not configured properly to know what item is the input. To fix this, add "
+                                "a `main_input_name` attribute to the model class you are using."
                             )
                         else:
-                            self.accelerator.clip_grad_norm_(
-                                model.parameters(),
-                                args.max_grad_norm,
-                            )
+                            self.state.num_input_tokens_seen += self.accelerator.gather(inputs[main_input_name]).numel()
+                    if rng_to_sync:
+                        self._load_rng_state(resume_from_checkpoint)
+                        rng_to_sync = False
 
-                    # Optimizer step
-                    self.optimizer.step()
-                    optimizer_was_run = not self.accelerator.optimizer_step_was_skipped
-                    if optimizer_was_run:
-                        # Delay optimizer scheduling until metrics are generated
-                        if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
-                            self.lr_scheduler.step()
+                    # Skip past any already trained steps if resuming training
+                    if steps_trained_in_current_epoch > 0:
+                        steps_trained_in_current_epoch -= 1
+                        if steps_trained_progress_bar is not None:
+                            steps_trained_progress_bar.update(1)
+                        if steps_trained_in_current_epoch == 0:
+                            self._load_rng_state(resume_from_checkpoint)
+                        continue
+                    elif steps_trained_progress_bar is not None:
+                        steps_trained_progress_bar.close()
+                        steps_trained_progress_bar = None
 
-                    model.zero_grad()
-                    self.state.global_step += 1
-                    self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
-                    self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+                    if step % args.gradient_accumulation_steps == 0:
+                        self.control = self.callback_handler.on_step_begin(args, self.state, self.control)
+        
+                    with self.accelerator.accumulate(model):
+                        tr_loss_step = self.training_step(model, inputs)
+                    #epoch_iterator.train_dw = self.train_dw
+                    if (
+                        args.logging_nan_inf_filter
+                        and not is_torch_tpu_available()
+                        and (torch.isnan(tr_loss_step) or torch.isinf(tr_loss_step))
+                    ):
+                        # if loss is nan or inf simply add the average of previous logged losses
+                        tr_loss += tr_loss / (1 + self.state.global_step - self._globalstep_last_logged)
+                    else:
+                        tr_loss += tr_loss_step
 
-                    self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
-                else:
-                    self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
+                    self.current_flos += float(self.floating_point_ops(inputs))
 
-                if self.control.should_epoch_stop or self.control.should_training_stop:
-                    break
+                    is_last_step_and_steps_less_than_grad_acc = (
+                        steps_in_epoch <= args.gradient_accumulation_steps and (step + 1) == steps_in_epoch
+                    )
+
+                    if (
+                        total_batched_samples % args.gradient_accumulation_steps == 0
+                        or
+                        # last step in epoch but step is always smaller than gradient_accumulation_steps
+                        is_last_step_and_steps_less_than_grad_acc
+                    ):
+                        # the `or` condition of `is_last_step_and_steps_less_than_grad_acc` is not covered
+                        # in accelerate. So, explicitly enable sync gradients to True in that case.
+                        if is_last_step_and_steps_less_than_grad_acc:
+                            self.accelerator.gradient_state._set_sync_gradients(True)
+
+                        # Gradient clipping
+                        if args.max_grad_norm is not None and args.max_grad_norm > 0:
+                            # deepspeed does its own clipping
+
+                            if is_sagemaker_mp_enabled() and args.fp16:
+                                self.optimizer.clip_master_grads(args.max_grad_norm)
+                            elif self.use_apex:
+                                # Revert to normal clipping otherwise, handling Apex or full precision
+                                nn.utils.clip_grad_norm_(
+                                    amp.master_params(self.optimizer),
+                                    args.max_grad_norm,
+                                )
+                            else:
+                                self.accelerator.clip_grad_norm_(
+                                    model.parameters(),
+                                    args.max_grad_norm,
+                                )
+
+                        # Optimizer step
+                        self.optimizer.step()
+                        optimizer_was_run = not self.accelerator.optimizer_step_was_skipped
+                        if optimizer_was_run:
+                            # Delay optimizer scheduling until metrics are generated
+                            if not isinstance(self.lr_scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau):
+                                self.lr_scheduler.step()
+
+                        model.zero_grad()
+                        self.state.global_step += 1
+                        self.state.epoch = epoch + (step + 1 + steps_skipped) / steps_in_epoch
+                        self.control = self.callback_handler.on_step_end(args, self.state, self.control)
+
+                        self._maybe_log_save_evaluate(tr_loss, model, trial, epoch, ignore_keys_for_eval)
+                    else:
+                        self.control = self.callback_handler.on_substep_end(args, self.state, self.control)
+
+                    if self.control.should_epoch_stop or self.control.should_training_stop:
+                        break
             if step < 0:
                 logger.warning(
                     "There seems to be not a single sample in your epoch_iterator, stopping training at step"
