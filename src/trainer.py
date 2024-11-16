@@ -941,8 +941,8 @@ class DoGETrainer(Trainer):
         loss_meme = torch.tensor(0.0)
         for domain_id in range(len(self.domain_list)):
             new_inputs = self.filter_inputs(inputs, domain_id)
-            #if self.ddk_iter == 1000:
-                #logger.warn(new_inputs)
+            if self.ddk_iter == 1000:
+                logger.warn(new_inputs)
             if new_inputs is None:
                 continue
             with self.compute_loss_context_manager():
@@ -950,8 +950,8 @@ class DoGETrainer(Trainer):
                 ref_ce_loss, ref_hidden_state = self.compute_loss(self.ref_model, new_inputs, return_outputs=False, return_pertoken_losses=False, is_ddk=True)
                 all_hidden_states.append(hidden_state)
                 ref_all_hidden_states.append(ref_hidden_state)
-                logger.warn(torch.exp(hidden_state))  # Predicted probabilities
-                logger.warn(torch.exp(ref_hidden_state))  # Reference probabilities
+                #logger.warn(torch.exp(hidden_state))  # Predicted probabilities
+                #logger.warn(torch.exp(ref_hidden_state))  # Reference probabilities
 
             # Compute KL Divergence
                 kl_loss = F.kl_div(
@@ -1100,12 +1100,14 @@ class DoGETrainer(Trainer):
             log_new_train_dw = log_new_train_dw - torch.logsumexp(log_new_train_dw, dim=0) # softmax normalization
             # smoothing
             dw_new = (1-self.reweight_eps) * torch.exp(log_new_train_dw) + self.reweight_eps / len(log_new_train_dw)
+            self.train_dw[self.train_ids] = dw_new
+            self.avg_dw[self.train_ids] += dw_new
+            self.dw_update_steps += 1
+            self.write_weights(cur_weights=self.train_dw, avg_weights=self.avg_dw/self.dw_update_steps)
+
+
         wandb_log_dict = {}
 
-        self.train_dw[self.train_ids] = dw_new
-        self.avg_dw[self.train_ids] += dw_new
-        self.dw_update_steps += 1
-        self.write_weights(cur_weights=self.train_dw, avg_weights=self.avg_dw/self.dw_update_steps)
     
         for domain_idx in range(len(self.domain_list)):
             domain_name = self.idx2domain[domain_idx]
@@ -1121,8 +1123,8 @@ class DoGETrainer(Trainer):
                         self.accelerator.backward(curr_domain_losses)
                     if self.args.max_grad_norm > 0.0:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
-            
-                wandb_log_dict[f'score/{domain_name}'] = excess_losses[score_idx].item()
+                if self.ddk_iter % 1000 == 0:
+                    wandb_log_dict[f'score/{domain_name}'] = excess_losses[score_idx].item()
                 wandb_log_dict[f'loss/{domain_name}'] = domain_losses_distributed[score_idx]
             wandb_log_dict[f'avg_dw/{domain_name}'] = self.avg_dw[domain_idx].item() / self.dw_update_steps
             wandb_log_dict[f'cur_dw/{domain_name}'] = self.train_dw[domain_idx].item()
