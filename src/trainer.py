@@ -908,7 +908,7 @@ class DoGETrainer(Trainer):
             #theta_sum = sum(theta)
             dw_new = soft(torch.stack(theta)) * 0.5 +  0.5 / len(theta)
         
-        self.train_dw[self.train_ids] = dw_new
+        self.train_dw = dw_new
         wandb_log_dict = {}
         for domain_idx in range(len(self.domain_list)):
             domain_name = self.idx2domain[domain_idx]
@@ -1069,7 +1069,7 @@ class DoGETrainer(Trainer):
         self.ddk_iter += 1
         wandb_log_dict = {}
         test_dataloader = self.get_test_dataloader(self.test_dataset)
-        if self.ddk_iter % 1000 == 0:
+        if self.ddk_iter % 1000 ==1:
             self.domain_losses = [torch.tensor(0.0) for _ in range(len(self.domain_list))] 
             self.ref_domain_losses = [torch.tensor(0.0) for _ in range(len(self.domain_list))] 
             self.tot_size = [torch.tensor(0.0) for _ in range(len(self.domain_list))]
@@ -1089,20 +1089,25 @@ class DoGETrainer(Trainer):
                         #ref_loss = torch.exp(ref_loss)
                         self.domain_losses[domain_id] += loss.detach().cpu() * new_inputs["input_ids"].shape[0]
                         self.ref_domain_losses[domain_id] += ref_loss.detach().cpu() * new_inputs["input_ids"].shape[0]
+            self.domain_losses = [l / 1000 for l in self.domain_losses]
+            self.ref_domain_losses = [l / 1000 for l in self.ref_domain_losses]
             excess_losses = torch.tensor([self.domain_losses[i]-self.ref_domain_losses[i] for i in range(len(domain_losses_distributed))], dtype=torch.float)
             for i in range(len(excess_losses)):
-                if (domain_losses_distributed[i]>0.0 or self.perdomain_scores is None):
+                if (self.domain_losses[i]>0.0 or self.perdomain_scores is None):
                     continue
                 excess_losses[i] = self.perdomain_scores[i]
             
-            excess_losses = torch.clip(excess_losses, min=0.0)        
+            excess_losses = torch.clip(excess_losses, min=0.0)
             self.perdomain_scores = excess_losses.detach().cpu().tolist()
             lr_t = self.lr_scheduler.get_last_lr()[0] if self.lr_scheduler is not None else self.args.learning_rate
             log_new_train_dw = torch.log(self.train_dw) + 0.1 * excess_losses
             log_new_train_dw = log_new_train_dw - torch.logsumexp(log_new_train_dw, dim=0) # softmax normalization
             # smoothing
             dw_new = (1-self.reweight_eps) * torch.exp(log_new_train_dw) + self.reweight_eps / len(log_new_train_dw)
-            self.train_dw[self.train_ids] = dw_new
+            logger.warn(dw_new)
+            logger.warn(self.train_dw)
+            logger.warn(excess_losses)
+            self.train_dw = dw_new
             self.avg_dw[self.train_ids] += dw_new
             self.dw_update_steps += 1
             self.write_weights(cur_weights=self.train_dw, avg_weights=self.avg_dw/self.dw_update_steps)
@@ -1123,7 +1128,7 @@ class DoGETrainer(Trainer):
                         self.accelerator.backward(curr_domain_losses)
                     if self.args.max_grad_norm > 0.0:
                         torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
-                if self.ddk_iter % 1000 == 0:
+                if self.ddk_iter % 1000 == 1:
                     wandb_log_dict[f'score/{domain_name}'] = excess_losses[score_idx].item()
                     wandb_log_dict[f'avg_dw/{domain_name}'] = self.avg_dw[domain_idx].item() / self.dw_update_steps
                     wandb_log_dict[f'cur_dw/{domain_name}'] = self.train_dw[domain_idx].item()
