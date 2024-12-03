@@ -939,6 +939,7 @@ class DoGETrainer(Trainer):
         all_hidden_states = []
         ref_all_hidden_states = []
         loss_meme = torch.tensor(0.0)
+        self.losses = [torch.tensor(0.0) for _ in range(len(self.domain_list))]
         for domain_id in range(len(self.domain_list)):
             new_inputs = self.filter_inputs(inputs, domain_id)
             if self.ddk_iter == 1000:
@@ -963,6 +964,7 @@ class DoGETrainer(Trainer):
                 #logger.warn(ce_loss)
                 #logger.warn(kl_loss)
                 loss = ce_loss + 0.05 * kl_loss
+                self.losses[domain_id] = loss + self.losses[domain_id]
 
                 #self.domain_losses_distributed[domain_id] = ce_loss + self.domain_losses_distributed[domain_id]
                 #self.ref_domain_losses_distributed[domain_id] = ref_ce_loss + self.ref_domain_losses_distributed[domain_id]
@@ -979,15 +981,21 @@ class DoGETrainer(Trainer):
             self.domain_losses_distributed = [torch.tensor(0.0) for _ in range(len(self.domain_list))] 
             self.ref_domain_losses_distributed = [torch.tensor(0.0) for _ in range(len(self.domain_list))] 
         self.ddk_iter += 1
-        if loss_meme > 0.0:
-            if self.use_apex:
-                with amp.scale_loss(loss_meme, self.optimizer) as scaled_curr_domain_losses:
-                    scaled_curr_domain_losses.backward()
-            else:
-                self.accelerator.backward(loss_meme)
-            if self.args.max_grad_norm > 0.0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
-            
+        for domain_id in range(len(self.domain_list)):
+            #if domain_id in self.train_ids:
+            #    score_id = self.train_ids.tolist().index(domain_id)
+            #else:
+            #    continue
+            loss_meme = self.losses[domain_id]
+            if loss_meme > 0.0:
+                if self.use_apex:
+                    with amp.scale_loss(loss_meme, self.optimizer) as scaled_curr_domain_losses:
+                        scaled_curr_domain_losses.backward()
+                else:
+                    self.accelerator.backward(loss_meme)
+                if self.args.max_grad_norm > 0.0:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+                
 
         # Return loss and hidden states
         return loss_all / effective_domains
@@ -1000,6 +1008,7 @@ class DoGETrainer(Trainer):
         loss_all = torch.tensor(0.0)
         ref_loss_all = torch.tensor(0.0)
         effective_domains = 0
+        loss_tot = torch.tensor(0.0)
         sample_counter = Counter(inputs["domain_ids"].flatten().detach().cpu().numpy())
         for i,c in sample_counter.items():
             if i in self.domain_update_counter.keys():
@@ -1020,7 +1029,7 @@ class DoGETrainer(Trainer):
                 )
                 #logger.warn(ce_loss)
                 #logger.warn(kl_loss)
-                loss = loss + 0.05 * kl_loss
+                loss_tot += (loss + 0.05 * kl_loss).cpu()
             print(self.args.world_size)
             if self.args.world_size>1:
                 if self.is_local_process_zero():
@@ -1057,14 +1066,14 @@ class DoGETrainer(Trainer):
             if self.args.gradient_accumulation_steps > 1:
                 self.domain_losses_distributed = [l / self.args.gradient_accumulation_steps for l in self.domain_losses_distributed]
                 self.ref_domain_losses_distributed = [l / self.args.gradient_accumulation_steps for l in self.ref_domain_losses_distributed]
-            self.update_domain_weights_doremi(self.domain_losses_distributed, model, self.ref_domain_losses_distributed)
+            self.update_domain_weights_doremi(self.domain_losses_distributed, model, self.ref_domain_losses_distributed, loss_tot)
 
             self.grad_acc_step = 0 
-            self.domain_losses_distributed = [torch.tensor(0.0) for _ in range(len(self.domain_list))] 
-            self.ref_domain_losses_distributed = [torch.tensor(0.0) for _ in range(len(self.domain_list))] 
+            self.domain_losses_distributed = [torch.tensor(0.0).cuda() for _ in range(len(self.domain_list))] 
+            self.ref_domain_losses_distributed = [torch.tensor(0.0).cuda() for _ in range(len(self.domain_list))] 
         return loss_all / (self.args.gradient_accumulation_steps*effective_domains)
     
-    def update_domain_weights_doremi(self, domain_losses_distributed, model, ref_domain_losses_distributed):
+    def update_domain_weights_doremi(self, domain_losses_distributed, model, ref_domain_losses_distributed, loss_tot):
         assert self.doremi, "Only run this function for doremi!"
         self.ddk_iter += 1
         wandb_log_dict = {}
@@ -1101,7 +1110,6 @@ class DoGETrainer(Trainer):
             self.perdomain_scores = excess_losses.detach().cpu().tolist()
             lr_t = self.lr_scheduler.get_last_lr()[0] if self.lr_scheduler is not None else self.args.learning_rate
             log_new_train_dw = torch.log(self.train_dw) + 0.1 * excess_losses
-            log_new_train_dw = log_new_train_dw - torch.logsumexp(log_new_train_dw, dim=0) # softmax normalization
             # smoothing
             dw_new = (1-self.reweight_eps) * torch.exp(log_new_train_dw) + self.reweight_eps / len(log_new_train_dw)
             logger.warn(dw_new)
@@ -1113,21 +1121,13 @@ class DoGETrainer(Trainer):
             self.write_weights(cur_weights=self.train_dw, avg_weights=self.avg_dw/self.dw_update_steps)
 
 
-    
+        cur_domain_losses = torch.tensor(0.0)
         for domain_idx in range(len(self.domain_list)):
             domain_name = self.idx2domain[domain_idx]
-            
+            curr_domain_losses = domain_losses_distributed[domain_idx] + cur_domain_losses#* dw_new[score_idx]
             if domain_idx in self.train_ids:
                 score_idx = self.train_ids.tolist().index(domain_idx)
-                curr_domain_losses = domain_losses_distributed[score_idx] #* dw_new[score_idx]
-                if curr_domain_losses > 0.0:
-                    if self.use_apex:
-                        with amp.scale_loss(curr_domain_losses, self.optimizer) as scaled_curr_domain_losses:
-                            scaled_curr_domain_losses.backward()
-                    else:
-                        self.accelerator.backward(curr_domain_losses)
-                    if self.args.max_grad_norm > 0.0:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
+            
                 if self.ddk_iter % 1000 == 1:
                     wandb_log_dict[f'score/{domain_name}'] = excess_losses[score_idx].item()
                     wandb_log_dict[f'avg_dw/{domain_name}'] = self.avg_dw[domain_idx].item() / self.dw_update_steps
@@ -1140,7 +1140,14 @@ class DoGETrainer(Trainer):
         
         lr_t = self.lr_scheduler.get_last_lr()[0] if self.lr_scheduler is not None else self.args.learning_rate
         wandb_log_dict['lr'] = lr_t
-        
+        if loss_tot > 0.0:
+            if self.use_apex:
+                with amp.scale_loss(loss_tot, self.optimizer) as scaled_curr_domain_losses:
+                    scaled_curr_domain_losses.backward()
+            else:
+                self.accelerator.backward(loss_tot)
+            if self.args.max_grad_norm > 0.0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.args.max_grad_norm)
         wandb.log(wandb_log_dict, commit=False)
     
     def train_step_selected(self, model, inputs):
