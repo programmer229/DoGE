@@ -103,16 +103,16 @@ def get_slimpajama_6b(subset='arxiv', num_proc=40,
     subset_name = SUBSET2META[subset]
     print('Load subset_name: ', subset_name)
         
-    if not os.path.exists(os.path.join(SUBSET_PATH, 'test.bin')):
+    if not os.path.exists(os.path.join(SUBSET_PATH, 'train.bin')):
         os.makedirs(SUBSET_PATH, exist_ok=True)
         print("FKoaKFLDKDLKA")
-        dataset = load_dataset("DKYoon/SlimPajama-6B", split=[ 'validation'])
+        dataset = load_dataset("DKYoon/SlimPajama-6B", split=[ 'train', 'test', 'validation'])
         print("ALFKLSKLFSKL")
         print(dataset)
         data_dict = {}
-        #data_dict['train'] = dataset[0].filter(lambda example: example["meta"]['redpajama_set_name']==subset_name)
-        #data_dict['val'] = dataset[1].filter(lambda example: example["meta"]['redpajama_set_name']==subset_name)
-        data_dict['test'] = dataset[0].filter(lambda example: example["meta"]['redpajama_set_name']==subset_name)
+        data_dict['train'] = dataset[0].filter(lambda example: example["meta"]['redpajama_set_name']==subset_name)
+        data_dict['val'] = dataset[1].filter(lambda example: example["meta"]['redpajama_set_name']==subset_name)
+        data_dict['test'] = dataset[2].filter(lambda example: example["meta"]['redpajama_set_name']==subset_name)
         import psutil
 
         #print(data_dict['train'])
@@ -131,18 +131,18 @@ def get_slimpajama_6b(subset='arxiv', num_proc=40,
         # tokenize the dataset
         tokenized = {}
         print(42)
-        #tokenized['train'] = data_dict['train'].map(
-        #    process,
-        #    remove_columns=['text', 'meta', '__index_level_0__'],
-        #    desc="tokenizing the splits",
-        #    num_proc=num_proc,
-        #)
-        #tokenized['val'] = data_dict['val'].map(
-        #    process,
-        #    remove_columns=['text', 'meta', '__index_level_0__'],
-        #    desc="tokenizing the splits",
-        #    num_proc=num_proc,
-        #)
+        tokenized['train'] = data_dict['train'].map(
+            process,
+            remove_columns=['text', 'meta', '__index_level_0__'],
+            desc="tokenizing the splits",
+            num_proc=num_proc,
+        )
+        tokenized['val'] = data_dict['val'].map(
+            process,
+            remove_columns=['text', 'meta', '__index_level_0__'],
+            desc="tokenizing the splits",
+            num_proc=num_proc,
+        )
         tokenized['test'] = data_dict['test'].map(
             process,
             remove_columns=['text', 'meta', '__index_level_0__'],

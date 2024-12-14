@@ -459,6 +459,7 @@ class DoGETrainer(Trainer):
         self.cc_selection = cc_selection
         self.cc_ns = cc_ns
         self.cc_steps = cc_steps
+        self.step_kek = 0
         if grad_acc is not None:
             self.args.gradient_accumulation_steps = grad_acc
         
@@ -1055,7 +1056,6 @@ class DoGETrainer(Trainer):
                 if self.args.n_gpu > 1:
                     loss = loss.mean()
                     ref_loss = ref_loss.mean()
-                print(domain_id, 42)
                 self.domain_losses_distributed[domain_id] = loss+self.domain_losses_distributed[domain_id]
                 self.ref_domain_losses_distributed[domain_id] = ref_loss+self.ref_domain_losses_distributed[domain_id]
                 ref_loss_all += ref_loss.detach().cpu()
@@ -1110,11 +1110,13 @@ class DoGETrainer(Trainer):
             self.perdomain_scores = excess_losses.detach().cpu().tolist()
             lr_t = self.lr_scheduler.get_last_lr()[0] if self.lr_scheduler is not None else self.args.learning_rate
             log_new_train_dw = torch.log(self.train_dw) + 0.1 * excess_losses
+            log_new_train_dw = log_new_train_dw - torch.logsumexp(log_new_train_dw, dim=0) # softmax normalization
             # smoothing
             dw_new = (1-self.reweight_eps) * torch.exp(log_new_train_dw) + self.reweight_eps / len(log_new_train_dw)
-            logger.warn(dw_new)
-            logger.warn(self.train_dw)
-            logger.warn(excess_losses)
+            logger.warning(dw_new)
+            logger.warning(self.train_dw)
+            logger.warning(excess_losses)
+            logger.warning("TROLOLOLO")
             self.train_dw = dw_new
             self.avg_dw[self.train_ids] += dw_new
             self.dw_update_steps += 1
@@ -1281,11 +1283,12 @@ class DoGETrainer(Trainer):
         inputs = self._prepare_inputs(inputs)
         # sample_counter = Counter(inputs["domain_ids"].flatten().detach().cpu().numpy())
         # print(sample_counter)
+        self.step_kek += 1
         if self.cc_selection:
             return self.train_cancellation(model, inputs)
-        if self.doremi:
+        if self.doremi and self.step_kek>-10:
             return self.train_step_doremi(model, inputs)
-        elif self.ddk:
+        elif self.ddk and self.step_kek>-10:
             return self.train_step_ddk(model, inputs)
         elif self.doge:
             if not self.compute_pertoken_losses:
@@ -1368,7 +1371,20 @@ class DoGETrainer(Trainer):
                 wandb_log_dict[f'sample_count/{domain_name}'] = self.domain_update_counter[domain_idx]    
             wandb.log(wandb_log_dict, commit=False)
             with self.compute_loss_context_manager():
-                loss = self.compute_loss(model, inputs, return_outputs=False, return_pertoken_losses=False)
+                loss, hidden_state = self.compute_loss(model, inputs, return_outputs=False, return_pertoken_losses=False, is_ddk=True)
+                #ref_loss = self.compute_loss(self.ref_model, inputs, return_outputs=False, return_pertoken_losses=False, is_ddk=False)
+                #kl_loss = F.kl_div(
+                #    hidden_state,
+                #    ref_hidden_state,
+                #    reduction='batchmean',
+                #    log_target=True
+                #)
+                #logger.warn(ce_loss)
+                #logger.warn(kl_loss)
+                #loss = + 0.05 * kl_loss
+
+
+
             if self.args.n_gpu > 1:
                 loss = loss.mean()
             if self.args.gradient_accumulation_steps > 1:
@@ -1406,7 +1422,7 @@ class DoGETrainer(Trainer):
             self._load_from_checkpoint(resume_from_checkpoint)
 
         # If model was re-initialized, put it on the right device and update self.model_wrapped
-        if model_reloaded:
+        if model_reloaded: 
             if self.place_model_on_device:
                 self._move_model_to_device(self.model, self.args.device)
             self.model_wrapped = self.model
