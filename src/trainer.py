@@ -1031,6 +1031,7 @@ class DoGETrainer(Trainer):
                 #logger.warn(ce_loss)
                 #logger.warn(kl_loss)
                 loss_tot += (loss + 0.05 * kl_loss).cpu()
+               #loss_tot += loss.cpu()
             print(self.args.world_size)
             if self.args.world_size>1:
                 if self.is_local_process_zero():
@@ -1286,9 +1287,9 @@ class DoGETrainer(Trainer):
         self.step_kek += 1
         if self.cc_selection:
             return self.train_cancellation(model, inputs)
-        if self.doremi and self.step_kek>-10:
+        if self.doremi and self.step_kek>-10000:
             return self.train_step_doremi(model, inputs)
-        elif self.ddk and self.step_kek>-10:
+        elif self.ddk and self.step_kek>-10000:
             return self.train_step_ddk(model, inputs)
         elif self.doge:
             if not self.compute_pertoken_losses:
@@ -2532,14 +2533,16 @@ class DoGETrainer(Trainer):
                     total_batched_samples += 1
                     if total_batched_samples % 1000 == 1:
                         #logger.warning(self.train_dw)
-                        self.train_dataset = interleave_datasets(
-                            self.train_orig_dataset,
-                            probabilities=self.train_dw,
-                            probabilities_handle=self.train_dw,
-                            seed=total_batched_samples)
-                        train_dataloader = self.get_train_dataloader()
-                        epoch_iterator = train_dataloader
-                        break
+                        #self.train_dataset = interleave_datasets(
+                        #    self.train_orig_dataset,
+                        #    probabilities=self.train_dw,
+                        #    probabilities_handle=self.train_dw,
+                        #    seed=total_batched_samples)
+                        #train_dataloader = self.get_train_dataloader()
+                        train_dataloader.dataset._ex_iterable.probabilities_handle = self.train_dw
+                        train_dataloader.dataset._ex_iterable.probabilities = self.train_dw
+                        #epoch_iterator = train_dataloader
+                        #continue
 
                     if self.args.include_num_input_tokens_seen:
                         main_input_name = getattr(self.model, "main_input_name", "input_ids")
