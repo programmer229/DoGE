@@ -205,6 +205,9 @@ class FullTrainingArguments(TrainingArguments):
     ddk: bool = field(
         default=False, metadata={"help": "DDK."}
     )
+    new_doremi: bool = field(
+        default=True, metadata={"help": "New DoReMi."}
+    )
     ref_model: str = field(
         default=None, metadata={"help": "path to pretrained reference model (only used to run DoReMi)."}
     )
@@ -448,6 +451,7 @@ class DoGETrainer(Trainer):
         self.train_orig_dataset = train_orig_dataset
         self.doremi = self.args.doremi 
         self.ddk = self.args.ddk
+        self.new_doremi = self.args.new_doremi
         self.test_dataset = test_dataset
         self.ref_model = ref_model
         self.mu = self.args.mu
@@ -460,7 +464,6 @@ class DoGETrainer(Trainer):
         self.cc_ns = cc_ns
         self.cc_steps = cc_steps
         self.step_kek = 0
-        self.new_doremi = True
         if grad_acc is not None:
             self.args.gradient_accumulation_steps = grad_acc
         
@@ -951,18 +954,20 @@ class DoGETrainer(Trainer):
             with self.compute_loss_context_manager():
                 ce_loss, hidden_state = self.compute_loss(model, new_inputs, return_outputs=False, return_pertoken_losses=False, is_ddk=True)
                 ref_ce_loss, ref_hidden_state = self.compute_loss(self.ref_model, new_inputs, return_outputs=False, return_pertoken_losses=False, is_ddk=True)
-                all_hidden_states.append(hidden_state)
-                ref_all_hidden_states.append(ref_hidden_state)
+                #all_hidden_states.append(hidden_state)
+                #ref_all_hidden_states.append(ref_hidden_state)
                 #logger.warn(torch.exp(hidden_state))  # Predicted probabilities
                 #logger.warn(torch.exp(ref_hidden_state))  # Reference probabilities
 
             # Compute KL Divergence
-                kl_loss = F.kl_div(
-                    hidden_state,
-                    ref_hidden_state,
-                    reduction='batchmean',
-                    log_target=True
-                )
+                print(hidden_state.shape, ref_hidden_state.shape)
+                #kl_loss = F.kl_div(
+                #    hidden_state,
+                #    ref_hidden_state,
+                #    reduction='batchmean',
+                #    log_target=True
+                #)
+                kl_loss = 0
                 #logger.warn(ce_loss)
                 #logger.warn(kl_loss)
                 loss = ce_loss + 0.05 * kl_loss
@@ -1023,12 +1028,13 @@ class DoGETrainer(Trainer):
             with self.compute_loss_context_manager():
                 loss, outputs, hid= self.compute_loss(model, new_inputs, return_outputs=True, return_pertoken_losses=False, is_ddk=True)
                 ref_loss, ref_outputs, ref_hid = self.compute_loss(self.ref_model, new_inputs, return_outputs=True, return_pertoken_losses=False, is_ddk=True)
-                kl_loss = F.kl_div(
-                    hid,
-                    ref_hid,
-                    reduction='batchmean',
-                    log_target=True
-                )
+                #kl_loss = F.kl_div(
+                #    hid,
+                #    ref_hid,
+                #    reduction='batchmean',
+                #    log_target=True
+                #)
+                kl_loss = 0
                 #logger.warn(ce_loss)
                 #logger.warn(kl_loss)
                 if self.new_doremi:
@@ -1083,7 +1089,8 @@ class DoGETrainer(Trainer):
         self.ddk_iter += 1
         wandb_log_dict = {}
         test_dataloader = self.get_test_dataloader(self.test_dataset)
-        if self.ddk_iter % 1000 ==1:
+        
+        if self.ddk_iter % 1000 ==1 and self.new_doremi:
             self.domain_losses = [torch.tensor(0.0) for _ in range(len(self.domain_list))] 
             self.ref_domain_losses = [torch.tensor(0.0) for _ in range(len(self.domain_list))] 
             self.tot_size = [torch.tensor(0.0) for _ in range(len(self.domain_list))]
@@ -1126,14 +1133,36 @@ class DoGETrainer(Trainer):
             self.avg_dw[self.train_ids] += dw_new
             self.dw_update_steps += 1
             self.write_weights(cur_weights=self.train_dw, avg_weights=self.avg_dw/self.dw_update_steps)
+        if not self.new_doremi:
+            excess_losses = torch.tensor([domain_losses_distributed[i]-ref_domain_losses_distributed[i] for i in range(len(domain_losses_distributed))], dtype=torch.float)
+            for i in range(len(excess_losses)):
+                if (domain_losses_distributed[i]>0.0 or self.perdomain_scores is None):
+                    continue
+                excess_losses[i] = self.perdomain_scores[i]
+            wandb_log_dict = {}
+            
+            excess_losses = torch.clip(excess_losses, min=0.0)        
+            self.perdomain_scores = excess_losses.detach().cpu().tolist()
+            lr_t = self.lr_scheduler.get_last_lr()[0] if self.lr_scheduler is not None else self.args.learning_rate
+            log_new_train_dw = torch.log(self.train_dw) + 0.1 * excess_losses
+            log_new_train_dw = log_new_train_dw - torch.logsumexp(log_new_train_dw, dim=0) # softmax normalization
+            # smoothing
+            dw_new = (1-self.reweight_eps) * torch.exp(log_new_train_dw) + self.reweight_eps / len(log_new_train_dw)
+            
+            self.train_dw[self.train_ids] = dw_new
+            self.avg_dw[self.train_ids] += dw_new
+            self.dw_update_steps += 1
+            self.write_weights(cur_weights=self.train_dw, avg_weights=self.avg_dw/self.dw_update_steps)
 
 
         cur_domain_losses = torch.tensor(0.0)
         for domain_idx in range(len(self.domain_list)):
             domain_name = self.idx2domain[domain_idx]
-            curr_domain_losses = domain_losses_distributed[domain_idx] + cur_domain_losses* dw_new[score_idx]
             if domain_idx in self.train_ids:
                 score_idx = self.train_ids.tolist().index(domain_idx)
+
+                if not self.new_doremi:
+                    curr_domain_losses = domain_losses_distributed[domain_idx] + cur_domain_losses* dw_new[score_idx]
             
                 if self.ddk_iter % 1000 == 1:
                     wandb_log_dict[f'score/{domain_name}'] = excess_losses[score_idx].item()
